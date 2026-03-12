@@ -62,14 +62,41 @@ function listContents(dir) {
 //    recursivamente ANTES do rd — garante remoção completa incluindo .git/.
 
 function removeWindows(agentDir, parentDir, auditorDirName) {
-  const batPath = path.join(os.tmpdir(), `auditor-rm-${Date.now()}.bat`);
+  // Estratégia de 3 etapas para contornar os locks do Windows:
+  //
+  // ETAPA 1 — Rename para fora do CWD (feito AGORA, com Node ainda vivo)
+  //   npm/Node mantêm o CWD project-auditor/ aberto. Mas rename() numa
+  //   pasta diferente é permitido mesmo com handles abertos no diretório
+  //   original. Renomeia para _auditor-rm-<ts>/ no diretório pai.
+  //   Resultado: project-auditor/ desaparece imediatamente para o usuário.
+  //
+  // ETAPA 2 — .bat desacoplado remove a pasta renomeada
+  //   O .bat aguarda 3s (npm/Node já morreram), roda attrib para tirar
+  //   atributos read-only do .git/, e então rd /s /q sem nenhum handle ativo.
+  //
+  // ETAPA 3 — .bat se auto-deleta
+
+  const ts         = Date.now();
+  const stagingDir = path.join(parentDir, `_auditor-rm-${ts}`);
+  const batPath    = path.join(os.tmpdir(), `auditor-rm-${ts}.bat`);
+
+  // Tenta o rename — se falhar (raro), cai no .bat direto
+  let targetDir = agentDir;
+  try {
+    fs.renameSync(agentDir, stagingDir);
+    targetDir = stagingDir;
+  } catch {
+    // Rename falhou (ex: cross-device) — usa agentDir original
+    targetDir = agentDir;
+  }
+
   const bat = [
     '@echo off',
-    'timeout /t 2 /nobreak >nul',
-    // Remove atributos read-only / system / hidden recursivamente (.git/ tem arquivos protegidos)
-    `attrib -r -s -h "${agentDir}\\*" /s /d >nul 2>&1`,
-    // rd /s /q agora consegue apagar tudo, incluindo .git/
-    `rd /s /q "${agentDir}"`,
+    'timeout /t 3 /nobreak >nul',
+    `attrib -r -s -h "${targetDir}\*" /s /d >nul 2>&1`,
+    `rd /s /q "${targetDir}"`,
+    // Remove também o agentDir original caso o rename tenha falhado
+    `if exist "${agentDir}" rd /s /q "${agentDir}"`,
     `del "${batPath}"`,
   ].join('\r\n');
 
@@ -82,9 +109,9 @@ function removeWindows(agentDir, parentDir, auditorDirName) {
   });
   child.unref();
 
-  console.log(`  🗑️  Remoção agendada — a pasta será apagada em instantes.`);
+  console.log(`  🗑️  Remoção agendada — arquivos serão apagados em instantes.`);
   console.log(`  ✅ project-auditor removido com sucesso!\n`);
-  console.log(`  Removido : ${auditorDirName}/  (via processo desacoplado)`);
+  console.log(`  Removido : ${auditorDirName}/`);
   console.log(`  Intacto  : ${parentDir}\n`);
 }
 
