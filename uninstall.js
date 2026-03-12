@@ -54,7 +54,7 @@ function listContents(dir) {
 //
 // 1. npm mantém handles em node_modules/.bin/*.cmd enquanto o processo Node
 //    está vivo → fs.rmSync falha com EBUSY.
-//    Fix: processo .bat desacoplado que aguarda o pai morrer antes de remover.
+//    Fix: script Node helper em %TEMP% executado via node.exe direto (sem npm).
 //
 // 2. git clone cria arquivos com atributos READ-ONLY / SYSTEM / HIDDEN dentro
 //    de .git/ → rd /s /q falha silenciosamente nesses arquivos.
@@ -62,51 +62,65 @@ function listContents(dir) {
 //    recursivamente ANTES do rd — garante remoção completa incluindo .git/.
 
 function removeWindows(agentDir, parentDir, auditorDirName) {
-  // Estratégia de 3 etapas para contornar os locks do Windows:
+  // ── Por que .bat não funciona ─────────────────────────────────────────────
+  // O diagnóstico mostrou que o npm adiciona project-auditor\node_modules\.bin
+  // no INÍCIO do PATH antes de rodar qualquer script filho. O Windows abre um
+  // handle de diretório nesse PATH, bloqueando a pasta pai inteira — inclusive
+  // renameSync. Não adianta timeout: o handle só libera quando o npm.cmd encerra.
   //
-  // ETAPA 1 — Rename para fora do CWD (feito AGORA, com Node ainda vivo)
-  //   npm/Node mantêm o CWD project-auditor/ aberto. Mas rename() numa
-  //   pasta diferente é permitido mesmo com handles abertos no diretório
-  //   original. Renomeia para _auditor-rm-<ts>/ no diretório pai.
-  //   Resultado: project-auditor/ desaparece imediatamente para o usuário.
-  //
-  // ETAPA 2 — .bat desacoplado remove a pasta renomeada
-  //   O .bat aguarda 3s (npm/Node já morreram), roda attrib para tirar
-  //   atributos read-only do .git/, e então rd /s /q sem nenhum handle ativo.
-  //
-  // ETAPA 3 — .bat se auto-deleta
+  // ── Solução ───────────────────────────────────────────────────────────────
+  // Grava um script Node helper em %TEMP% e executa via process.execPath
+  // (node.exe absoluto) com PATH mínimo. O caminho alvo é passado como
+  // argumento — sem embutir strings com barras invertidas no código gerado.
 
   const ts         = Date.now();
-  const stagingDir = path.join(parentDir, `_auditor-rm-${ts}`);
-  const batPath    = path.join(os.tmpdir(), `auditor-rm-${ts}.bat`);
+  const helperPath = path.join(os.tmpdir(), `auditor-rm-${ts}.mjs`);
 
-  // Tenta o rename — se falhar (raro), cai no .bat direto
-  let targetDir = agentDir;
+  // O helper recebe o caminho via process.argv[2] — zero problema de escaping
+  const helperScript = `
+import { execSync } from 'child_process';
+import { rmSync, existsSync, unlinkSync } from 'fs';
+import { setTimeout as wait } from 'timers/promises';
+
+const target = process.argv[2];
+const self   = process.argv[3];
+
+// Aguarda npm.cmd + node.exe pai encerrarem e o SO liberar handles do PATH
+await wait(3000);
+
+if (existsSync(target)) {
   try {
-    fs.renameSync(agentDir, stagingDir);
-    targetDir = stagingDir;
-  } catch {
-    // Rename falhou (ex: cross-device) — usa agentDir original
-    targetDir = agentDir;
+    // Destravar atributos read-only/system/hidden (necessário para .git/ objects)
+    execSync(\`attrib -r -s -h "\${target}\\\\*" /s /d\`, { stdio: 'ignore', windowsHide: true });
+  } catch (_) {}
+  try {
+    rmSync(target, { recursive: true, force: true, maxRetries: 5, retryDelay: 500 });
+  } catch (_) {
+    try { execSync(\`rd /s /q "\${target}"\`, { stdio: 'ignore', windowsHide: true }); } catch (_2) {}
   }
+}
 
-  const bat = [
-    '@echo off',
-    'timeout /t 3 /nobreak >nul',
-    `attrib -r -s -h "${targetDir}\*" /s /d >nul 2>&1`,
-    `rd /s /q "${targetDir}"`,
-    // Remove também o agentDir original caso o rename tenha falhado
-    `if exist "${agentDir}" rd /s /q "${agentDir}"`,
-    `del "${batPath}"`,
-  ].join('\r\n');
+try { unlinkSync(self); } catch (_) {}
+`.trimStart();
 
-  fs.writeFileSync(batPath, bat, 'utf8');
+  fs.writeFileSync(helperPath, helperScript, 'utf8');
 
-  const child = cp.spawn('cmd.exe', ['/c', batPath], {
-    detached:    true,
-    stdio:       'ignore',
-    windowsHide: true,
-  });
+  // Executa node.exe diretamente — PATH mínimo, zero herança do npm
+  const child = cp.spawn(
+    process.execPath,
+    [helperPath, agentDir, helperPath],
+    {
+      detached:    true,
+      stdio:       'ignore',
+      windowsHide: true,
+      env: {
+        SystemRoot: process.env.SystemRoot || 'C:\\Windows',
+        TEMP:       process.env.TEMP       || os.tmpdir(),
+        TMP:        process.env.TMP        || os.tmpdir(),
+        PATH:       (process.env.SystemRoot || 'C:\\Windows') + '\\system32',
+      },
+    }
+  );
   child.unref();
 
   console.log(`  🗑️  Remoção agendada — arquivos serão apagados em instantes.`);
@@ -114,7 +128,6 @@ function removeWindows(agentDir, parentDir, auditorDirName) {
   console.log(`  Removido : ${auditorDirName}/`);
   console.log(`  Intacto  : ${parentDir}\n`);
 }
-
 function removeUnix(agentDir) {
   try { process.chdir(path.resolve(agentDir, '..')); } catch {}
   // chmod recursivo garante que arquivos read-only do .git/ não bloqueiem a remoção
@@ -350,9 +363,9 @@ async function main() {
   console.log(`${line('═')}`);
 
   if (isWin) {
-    // Windows: processo desacoplado via .bat — contorna EBUSY do npm
+    // Windows: script Node helper em %TEMP% — contorna lock do npm no PATH
     removeWindows(agentDir, parentDir, auditorDirName);
-    process.exit(0); // encerra o Node; o .bat remove a pasta após 2s
+    process.exit(0); // encerra o Node; o helper remove a pasta após 3s
   } else {
     // Unix/macOS: remoção direta após chdir
     removeUnix(agentDir);
