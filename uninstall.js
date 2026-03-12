@@ -1,10 +1,9 @@
 #!/usr/bin/env node
 'use strict';
 
-const fs     = require('fs');
-const path   = require('path');
-const os     = require('os');
-const cp     = require('child_process');
+const fs   = require('fs');
+const path = require('path');
+const os   = require('os');
 
 const AGENT_PACKAGE_NAME    = 'project-auditor';
 const AGENT_SIGNATURE_FILES = [
@@ -19,8 +18,8 @@ const AGENT_SIGNATURE_FILES = [
 function line(char = '─', len = 52) { return char.repeat(len); }
 
 function formatSize(b) {
-  if (b < 1024)       return `${b} B`;
-  if (b < 1_048_576)  return `${(b / 1024).toFixed(1)} KB`;
+  if (b < 1024)      return `${b} B`;
+  if (b < 1_048_576) return `${(b / 1024).toFixed(1)} KB`;
   return `${(b / 1_048_576).toFixed(1)} MB`;
 }
 
@@ -35,128 +34,120 @@ function getDirSize(d) {
   return t;
 }
 
-function listContents(dir) {
-  const out = [];
-  function walk(d, pre = '') {
-    let entries;
-    try { entries = fs.readdirSync(d, { withFileTypes: true }); } catch { return; }
-    for (const e of entries) {
-      out.push(pre + e.name + (e.isDirectory() ? '/' : ''));
-      if (e.isDirectory()) walk(path.join(d, e.name), pre + '  ');
+// ── Remoção arquivo por arquivo ───────────────────────────────────────────────
+// Estratégia: nunca tenta rmdir no diretório raiz (que o Windows bloqueia
+// por ser o CWD do terminal). Em vez disso:
+//   1. Percorre toda a árvore de arquivos recursivamente
+//   2. Remove cada arquivo individualmente com unlinkSync
+//   3. Remove subdiretórios vazios de baixo para cima (exceto a raiz)
+// Resultado: pasta raiz fica vazia. O Windows pode manter o handle,
+// mas todos os arquivos e conteúdo são apagados.
+
+function deleteAllFiles(dir) {
+  let entries;
+  try { entries = fs.readdirSync(dir, { withFileTypes: true }); }
+  catch { return; }
+
+  for (const e of entries) {
+    const p = path.join(dir, e.name);
+    if (e.isDirectory()) {
+      deleteAllFiles(p);
+      // Remove o subdiretório se estiver vazio (funciona pois não é o CWD)
+      try { fs.rmdirSync(p); } catch {}
+    } else {
+      // Garante que o arquivo não é read-only antes de deletar (.git objects)
+      try { fs.chmodSync(p, 0o666); } catch {}
+      try { fs.unlinkSync(p); } catch (err) {
+        // Se falhar, tenta forçar via attrib no Windows
+        if (os.platform() === 'win32') {
+          try {
+            require('child_process').execSync(
+              `attrib -r -s -h "${p}"`,
+              { stdio: 'ignore', windowsHide: true }
+            );
+            fs.unlinkSync(p);
+          } catch {}
+        }
+      }
     }
   }
-  walk(dir);
-  return out;
 }
 
-// ── Remoção robusta no Windows ────────────────────────────────────────────────
-// Dois problemas combinados no Windows:
+function countRemainingFiles(dir) {
+  let count = 0;
+  try {
+    for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+      const p = path.join(dir, e.name);
+      if (e.isDirectory()) count += countRemainingFiles(p);
+      else count++;
+    }
+  } catch {}
+  return count;
+}
+
+// ── Remoção diferida da pasta raiz ───────────────────────────────────────────
+// Após apagar todos os arquivos, a pasta raiz pode ficar bloqueada porque
+// o terminal tem ela como CWD. Quando o usuário fizer cd para outro lugar,
+// o handle é liberado automaticamente pelo SO.
 //
-// 1. npm mantém handles em node_modules/.bin/*.cmd enquanto o processo Node
-//    está vivo → fs.rmSync falha com EBUSY.
-//    Fix: script Node helper em %TEMP% executado via node.exe direto (sem npm).
+// Este mecanismo spawna um processo Node filho desacoplado que fica tentando
+// rmdir a cada 500ms por até 60 segundos. Assim que o terminal sair da pasta
+// (ou qualquer outro processo liberar o handle), o rmdir funciona sozinho.
 //
-// 2. git clone cria arquivos com atributos READ-ONLY / SYSTEM / HIDDEN dentro
-//    de .git/ → rd /s /q falha silenciosamente nesses arquivos.
-//    Fix: attrib -r -s -h /s /d remove todos os atributos restritivos
-//    recursivamente ANTES do rd — garante remoção completa incluindo .git/.
+// Funciona igual no Windows e Linux — sem admin, sem registry, sem reboot.
 
-function removeWindows(agentDir, parentDir, auditorDirName) {
-  // ── Por que .bat não funciona ─────────────────────────────────────────────
-  // O diagnóstico mostrou que o npm adiciona project-auditor\node_modules\.bin
-  // no INÍCIO do PATH antes de rodar qualquer script filho. O Windows abre um
-  // handle de diretório nesse PATH, bloqueando a pasta pai inteira — inclusive
-  // renameSync. Não adianta timeout: o handle só libera quando o npm.cmd encerra.
-  //
-  // ── Solução ───────────────────────────────────────────────────────────────
-  // Grava um script Node helper em %TEMP% e executa via process.execPath
-  // (node.exe absoluto) com PATH mínimo. O caminho alvo é passado como
-  // argumento — sem embutir strings com barras invertidas no código gerado.
+function spawnDeferredRmdir(agentDir) {
+  const cp         = require('child_process');
+  const os         = require('os');
+  const path       = require('path');
+  const helperPath = path.join(os.tmpdir(), `auditor-rmdir-${Date.now()}.mjs`);
 
-  const ts         = Date.now();
-  const helperPath = path.join(os.tmpdir(), `auditor-rm-${ts}.mjs`);
-
-  // O helper recebe o caminho via process.argv[2] — zero problema de escaping
-  const helperScript = `
-import { execSync } from 'child_process';
-import { rmSync, existsSync, unlinkSync } from 'fs';
+  const script = `
+import { rmdirSync, existsSync, unlinkSync } from 'fs';
 import { setTimeout as wait } from 'timers/promises';
 
 const target = process.argv[2];
 const self   = process.argv[3];
+const start  = Date.now();
+const TIMEOUT = 60_000; // 60 segundos
+const INTERVAL = 500;   // tenta a cada 500ms
 
-// Aguarda npm.cmd + node.exe pai encerrarem e o SO liberar handles do PATH
-await wait(3000);
-
-if (existsSync(target)) {
+while (Date.now() - start < TIMEOUT) {
+  if (!existsSync(target)) break; // já foi removida
   try {
-    // Destravar atributos read-only/system/hidden (necessário para .git/ objects)
-    execSync(\`attrib -r -s -h "\${target}\\\\*" /s /d\`, { stdio: 'ignore', windowsHide: true });
-  } catch (_) {}
-  try {
-    rmSync(target, { recursive: true, force: true, maxRetries: 5, retryDelay: 500 });
-  } catch (_) {
-    try { execSync(\`rd /s /q "\${target}"\`, { stdio: 'ignore', windowsHide: true }); } catch (_2) {}
+    rmdirSync(target);
+    break; // removeu com sucesso
+  } catch {
+    await wait(INTERVAL);
   }
 }
 
-try { unlinkSync(self); } catch (_) {}
+try { unlinkSync(self); } catch {}
 `.trimStart();
 
-  fs.writeFileSync(helperPath, helperScript, 'utf8');
+  require('fs').writeFileSync(helperPath, script, 'utf8');
 
-  // Executa node.exe diretamente — PATH mínimo, zero herança do npm
-  const child = cp.spawn(
-    process.execPath,
-    [helperPath, agentDir, helperPath],
-    {
-      detached:    true,
-      stdio:       'ignore',
-      windowsHide: true,
-      env: {
-        SystemRoot: process.env.SystemRoot || 'C:\\Windows',
-        TEMP:       process.env.TEMP       || os.tmpdir(),
-        TMP:        process.env.TMP        || os.tmpdir(),
-        PATH:       (process.env.SystemRoot || 'C:\\Windows') + '\\system32',
-      },
-    }
-  );
-  child.unref();
-
-  console.log(`  🗑️  Remoção agendada — arquivos serão apagados em instantes.`);
-  console.log(`  ✅ project-auditor removido com sucesso!\n`);
-  console.log(`  Removido : ${auditorDirName}/`);
-  console.log(`  Intacto  : ${parentDir}\n`);
-}
-function removeUnix(agentDir) {
-  try { process.chdir(path.resolve(agentDir, '..')); } catch {}
-  // chmod recursivo garante que arquivos read-only do .git/ não bloqueiem a remoção
-  chmodRecursive(agentDir);
-  fs.rmSync(agentDir, { recursive: true, force: true });
+  cp.spawn(process.execPath, [helperPath, agentDir, helperPath], {
+    detached:    true,
+    stdio:       'ignore',
+    windowsHide: true,
+    env: {
+      SystemRoot: process.env.SystemRoot || 'C:\\Windows',
+      TEMP:       process.env.TEMP       || os.tmpdir(),
+      TMP:        process.env.TMP        || os.tmpdir(),
+      PATH:       (process.env.SystemRoot || 'C:\\Windows') + '\\system32',
+    },
+  }).unref();
 }
 
-// Torna todos os arquivos graváveis antes de rmSync (necessário para .git/ no Unix)
-function chmodRecursive(target) {
-  try {
-    const entries = fs.readdirSync(target, { withFileTypes: true });
-    for (const e of entries) {
-      const p = path.join(target, e.name);
-      try { fs.chmodSync(p, 0o755); } catch {}
-      if (e.isDirectory()) chmodRecursive(p);
-    }
-  } catch {}
-}
-
-// ── Sistema de input robusto ──────────────────────────────────────────────────
+// ── Sistema de input ──────────────────────────────────────────────────────────
 
 let _pipeLines = null;
 let _pipeIdx   = 0;
 
 function detectInputMode() {
   return new Promise(resolve => {
-    let buf      = '';
-    let resolved = false;
-
+    let buf = '', resolved = false;
     process.stdin.setEncoding('utf8');
     process.stdin.resume();
 
@@ -187,18 +178,16 @@ function detectInputMode() {
 function ask(question) {
   return new Promise(resolve => {
     process.stdout.write(question);
-
     if (_pipeLines !== null) {
       const answer = _pipeLines[_pipeIdx++] ?? '';
       process.stdout.write(answer + '\n');
       resolve(answer);
       return;
     }
-
     const { createInterface } = require('readline');
     process.stdin.resume();
     const rl = createInterface({ input: process.stdin, output: process.stdout, terminal: false });
-    rl.once('line', answer => { rl.close(); process.stdin.pause(); resolve(answer.trim()); });
+    rl.once('line', a => { rl.close(); process.stdin.pause(); resolve(a.trim()); });
     rl.once('close', () => resolve(''));
   });
 }
@@ -236,28 +225,19 @@ function resolveDirectories() {
     console.error('\n❌ ABORTADO: agentDir === parentDir. Recusando remover a raiz.\n');
     process.exit(1);
   }
-  const looksLikeProject = ['package.json', 'src', '.git', 'composer.json', 'go.mod', 'artisan', 'requirements.txt']
-    .some(i => fs.existsSync(path.join(parentDir, i)));
-  if (!looksLikeProject) {
-    console.warn(`\n⚠️  O diretório pai não parece ser um projeto reconhecido: ${parentDir}\n`);
-  }
   return { agentDir, parentDir };
 }
 
-// ── Aviso de relatórios pendentes ─────────────────────────────────────────────
-// Não copia mais para fora da pasta do auditor.
-// Mostra os relatórios disponíveis e lembra o usuário de consultá-los
-// antes de confirmar a remoção.
+// ── Aviso de relatórios ───────────────────────────────────────────────────────
 
 function warnAboutReports(agentDir) {
   const reportsDir = path.join(agentDir, 'reports');
   if (!fs.existsSync(reportsDir)) return;
   const reports = fs.readdirSync(reportsDir).filter(f => f.endsWith('.md'));
   if (!reports.length) return;
-
   console.log(`\n📄 ${reports.length} relatório(s) em reports/ (serão removidos junto):`);
   reports.forEach(r => console.log(`   • ${r}`));
-  console.log(`   ℹ️  Consulte-os antes de continuar, ou abra-os agora em outro terminal.\n`);
+  console.log(`   ℹ️  Consulte-os antes de continuar.\n`);
 }
 
 // ── Limpeza do .gitignore ─────────────────────────────────────────────────────
@@ -267,40 +247,28 @@ function cleanGitignore(parentDir, auditorDirName) {
   if (!fs.existsSync(giPath)) return;
 
   const original = fs.readFileSync(giPath, 'utf8');
-  const lines    = original.split('\n');
-
   const auditorEntries = new Set([
-    `${auditorDirName}/`,
-    `/${auditorDirName}/`,
-    auditorDirName,
-    'audit-reports/',
-    '/audit-reports/',
-    '# Project Auditor — remova após usar',
-    '# Project Auditor',
+    `${auditorDirName}/`, `/${auditorDirName}/`, auditorDirName,
+    'audit-reports/', '/audit-reports/',
+    '# Project Auditor — remova após usar', '# Project Auditor',
   ]);
 
-  const cleaned = lines.filter(l => !auditorEntries.has(l.trim()));
-
-  const dedupedBlanks = cleaned.reduce((acc, l) => {
+  let cleaned = original.split('\n').filter(l => !auditorEntries.has(l.trim()));
+  cleaned = cleaned.reduce((acc, l) => {
     if (l.trim() === '' && acc.length > 0 && acc[acc.length - 1].trim() === '') return acc;
     acc.push(l);
     return acc;
   }, []);
+  while (cleaned.length && cleaned[cleaned.length - 1].trim() === '') cleaned.pop();
 
-  while (dedupedBlanks.length && dedupedBlanks[dedupedBlanks.length - 1].trim() === '') {
-    dedupedBlanks.pop();
-  }
-
-  const result = dedupedBlanks.join('\n') + (dedupedBlanks.length ? '\n' : '');
-
+  const result = cleaned.join('\n') + (cleaned.length ? '\n' : '');
   if (result === original) return;
 
   try {
     fs.writeFileSync(giPath, result, 'utf8');
     console.log(`  🧹 .gitignore restaurado — entradas do auditor removidas.`);
   } catch {
-    console.warn(`  ⚠️  Não foi possível limpar o .gitignore. Remova manualmente:`);
-    console.warn(`      "${auditorDirName}/" do arquivo .gitignore\n`);
+    console.warn(`  ⚠️  Não foi possível limpar o .gitignore. Remova manualmente: "${auditorDirName}/"`);
   }
 }
 
@@ -308,7 +276,6 @@ function cleanGitignore(parentDir, auditorDirName) {
 
 async function main() {
   const autoYes = process.argv.includes('--yes') || process.argv.includes('-y');
-  const isWin   = os.platform() === 'win32';
 
   if (!autoYes) await detectInputMode();
 
@@ -325,15 +292,7 @@ async function main() {
   console.log(`  Removendo   : ${agentDir}`);
   console.log(`  Projeto pai : ${parentDir}`);
   console.log(`  Tamanho     : ${formatSize(getDirSize(agentDir))}\n`);
-  console.log(`${line()}`);
-  console.log('  📦 Será removido:');
-  console.log(`${line()}`);
-  const contents = listContents(agentDir);
-  contents.slice(0, 20).forEach(c => console.log(`  ${c}`));
-  if (contents.length > 20) console.log(`  ... e mais ${contents.length - 20} item(ns)`);
-  console.log(`${line()}\n`);
 
-  // Avisa sobre relatórios mas NÃO copia para fora
   warnAboutReports(agentDir);
 
   console.log(`${line()}`);
@@ -355,31 +314,44 @@ async function main() {
     process.exit(0);
   }
 
-  console.log('\n  🗑️  Removendo...\n');
+  console.log('\n  🗑️  Removendo arquivos...\n');
 
-  // Limpa .gitignore ANTES de remover a pasta (ainda temos __dirname válido)
+  // Limpa .gitignore primeiro (enquanto os arquivos ainda existem)
   cleanGitignore(parentDir, auditorDirName);
+
+  // Remove todos os arquivos e subdiretórios (exceto o diretório raiz)
+  deleteAllFiles(agentDir);
+
+  // Tenta remover o diretório raiz (funciona se o CWD for o pai)
+  try { fs.rmdirSync(agentDir); } catch {}
+
+  const remaining = countRemainingFiles(agentDir);
+  const rootGone  = !fs.existsSync(agentDir);
 
   console.log(`${line('═')}`);
 
-  if (isWin) {
-    // Windows: script Node helper em %TEMP% — contorna lock do npm no PATH
-    removeWindows(agentDir, parentDir, auditorDirName);
-    process.exit(0); // encerra o Node; o helper remove a pasta após 3s
-  } else {
-    // Unix/macOS: remoção direta após chdir
-    removeUnix(agentDir);
-
-    if (fs.existsSync(agentDir)) {
-      console.error(`\n❌ Pasta ainda existe. Execute manualmente:\n   rm -rf "${agentDir}"\n`);
-      process.exit(1);
-    }
-
+  if (rootGone) {
     console.log('  ✅ project-auditor removido com sucesso!\n');
     console.log(`  Removido : ${auditorDirName}/`);
     console.log(`  Intacto  : ${parentDir}\n`);
-    process.exit(0);
+  } else if (remaining === 0) {
+    // Pasta vazia — spawna processo que remove assim que o terminal sair
+    spawnDeferredRmdir(agentDir);
+    console.log('  ✅ Todos os arquivos removidos com sucesso!\n');
+    console.log(`  📁 A pasta "${auditorDirName}/" está vazia e será removida`);
+    console.log(`     automaticamente assim que você sair dela no terminal.\n`);
+    console.log(`  💡 Execute: cd "${parentDir}"\n`);
+  } else {
+    console.log(`  ⚠️  ${remaining} arquivo(s) não puderam ser removidos.`);
+    console.log(`  O restante foi apagado. Remova manualmente:\n`);
+    if (os.platform() === 'win32') {
+      console.log(`    rd /s /q "${agentDir}"\n`);
+    } else {
+      console.log(`    rm -rf "${agentDir}"\n`);
+    }
   }
+
+  process.exit(0);
 }
 
 main().catch(err => {
