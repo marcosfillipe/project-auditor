@@ -50,37 +50,37 @@ function listContents(dir) {
 }
 
 // ── Remoção robusta no Windows ────────────────────────────────────────────────
-// No Windows, npm mantém handles em node_modules/.bin/*.cmd durante toda a
-// execução do script. fs.rmSync falha com EBUSY enquanto o processo Node
-// (filho do npm) ainda estiver vivo.
+// Dois problemas combinados no Windows:
 //
-// Solução: escreve um .bat temporário em %TEMP% que:
-//   1. Aguarda 2 segundos (processo pai termina)
-//   2. Executa rd /s /q sobre a pasta do auditor
-//   3. Se sobrar a pasta %TEMP%\auditor-rm-*.bat, apaga ela mesma
+// 1. npm mantém handles em node_modules/.bin/*.cmd enquanto o processo Node
+//    está vivo → fs.rmSync falha com EBUSY.
+//    Fix: processo .bat desacoplado que aguarda o pai morrer antes de remover.
 //
-// O .bat é disparado com spawn detached + stdio ignorado, e o processo Node
-// encerra imediatamente depois (não aguarda o filho).
+// 2. git clone cria arquivos com atributos READ-ONLY / SYSTEM / HIDDEN dentro
+//    de .git/ → rd /s /q falha silenciosamente nesses arquivos.
+//    Fix: attrib -r -s -h /s /d remove todos os atributos restritivos
+//    recursivamente ANTES do rd — garante remoção completa incluindo .git/.
 
 function removeWindows(agentDir, parentDir, auditorDirName) {
   const batPath = path.join(os.tmpdir(), `auditor-rm-${Date.now()}.bat`);
   const bat = [
     '@echo off',
     'timeout /t 2 /nobreak >nul',
+    // Remove atributos read-only / system / hidden recursivamente (.git/ tem arquivos protegidos)
+    `attrib -r -s -h "${agentDir}\\*" /s /d >nul 2>&1`,
+    // rd /s /q agora consegue apagar tudo, incluindo .git/
     `rd /s /q "${agentDir}"`,
-    // Limpa a entrada do .gitignore depois de garantir que a pasta sumiu
-    // (não podemos chamar Node aqui, mas a limpeza do .gitignore já foi feita antes de chamar esta função)
     `del "${batPath}"`,
   ].join('\r\n');
 
   fs.writeFileSync(batPath, bat, 'utf8');
 
   const child = cp.spawn('cmd.exe', ['/c', batPath], {
-    detached:  true,
-    stdio:     'ignore',
+    detached:    true,
+    stdio:       'ignore',
     windowsHide: true,
   });
-  child.unref(); // desacopla completamente do pai
+  child.unref();
 
   console.log(`  🗑️  Remoção agendada — a pasta será apagada em instantes.`);
   console.log(`  ✅ project-auditor removido com sucesso!\n`);
@@ -90,7 +90,21 @@ function removeWindows(agentDir, parentDir, auditorDirName) {
 
 function removeUnix(agentDir) {
   try { process.chdir(path.resolve(agentDir, '..')); } catch {}
+  // chmod recursivo garante que arquivos read-only do .git/ não bloqueiem a remoção
+  chmodRecursive(agentDir);
   fs.rmSync(agentDir, { recursive: true, force: true });
+}
+
+// Torna todos os arquivos graváveis antes de rmSync (necessário para .git/ no Unix)
+function chmodRecursive(target) {
+  try {
+    const entries = fs.readdirSync(target, { withFileTypes: true });
+    for (const e of entries) {
+      const p = path.join(target, e.name);
+      try { fs.chmodSync(p, 0o755); } catch {}
+      if (e.isDirectory()) chmodRecursive(p);
+    }
+  } catch {}
 }
 
 // ── Sistema de input robusto ──────────────────────────────────────────────────
