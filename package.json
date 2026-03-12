@@ -1,0 +1,21 @@
+{
+  "name": "project-auditor",
+  "version": "1.0.0",
+  "description": "Agente CLI de auditoria de segurança, performance e qualidade para projetos Node.js",
+  "main": "index.js",
+  "scripts": {
+    "check":         "node index.js",
+    "check:ui":      "node index-ui.js",
+    "uninstall":     "node uninstall.js",
+    "uninstall:yes": "node uninstall.js --yes"
+  },
+  "keywords": ["security", "audit", "cli", "nodejs"],
+  "license": "MIT",
+  "dependencies": {
+    "chalk":      "^4.1.2",
+    "fs-extra":   "^11.2.0",
+    "glob":       "^10.3.10",
+    "semver":     "^7.6.0",
+    "playwright": "^1.51.0"
+  }
+}
